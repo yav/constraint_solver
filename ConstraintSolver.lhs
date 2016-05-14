@@ -39,8 +39,13 @@ worry about universal quantifiers and qualified types. The types `TVar`,
 type constructors, and type functions, respectively:
 
 > type TVar = String
-> type TCon = String
-> type TFun = String
+> data TCon = TUserCon String
+>           | TNat Integer
+>             deriving Eq
+
+> data TFun = TUserFun String
+>           | TAdd | TSub
+>             deriving Eq
 
 Here we use `String` for all of these types, but any other type would do.
 All we need is a notion of equality, and an ordering for the names of
@@ -76,7 +81,7 @@ represented as `TFun f ts :=: t`, they are common enough that we define a
 custom type to capture this pattern:
 
 > -- | An equation of the form: @F ts ~ t@
-> data TFunEqn    = TFunEqn TFun [SimpleType] SimpleType
+> data TFunEqn = TFunEqn TFun [SimpleType] SimpleType
 
 
 
@@ -158,7 +163,10 @@ This process is formalized with the function `toSimpleType`:
 >       let (s1, xs)  = mapAccumL toSimpleType s ts
 >           (s2, x)   = newTVar s1
 >           newT      = TVar x
->       in  (addTFunEqn (TFunEqn f xs newT) s2, newT)
+>           eqn = case (f,xs) of
+>                  (TSub,[a,b]) -> TFunEqn TAdd [b,newT] a
+>                  _            -> TFunEqn f    xs       newT
+>       in (addTFunEqn eqn s2, newT)
 
 Equation generated in the process of simplifying a type are added
 to the work queue.  Once we have `toSimpleType` it is easy to
@@ -191,6 +199,10 @@ to the inert function equations.
 > data Inerts = Inerts { inertSubst :: Subst
 >                      , inertFuns  :: [TFunEqn]
 >                      }
+
+
+
+
 
 Next are a few convenient functions for manipulating the state:
 
@@ -426,6 +438,123 @@ it is simple to generalize to a collection of equations:
 > lookupDef :: [TFunDef] -> TFun -> [SimpleType] -> Maybe Type
 > lookupDef allDefs tf args =
 >   msum [ useDefn def tf args | def <- allDefs ]
+>
+> data SimpStep = Simplified [Ct]
+>               | Impossible
+
+> data Ct = EqCt (Eqn SimpleType)
+>         | FunCt TFunEqn
+
+
+
+> simpArith :: TFunEqn -> Maybe SimpStep
+> simpArith (TFunEqn TAdd [a,b] c)
+
+  No 0 in addition equations
+
+>   | TCon (TNat 0) <- a  = Just $ eqs [ b :=: c ]
+>   | TCon (TNat 0) <- b  = Just $ eqs [ a :=: c ]
+>   | TCon (TNat 0) <- c  = Just $ eqs [ a :=: TCon (TNat 0)
+>                                      , b :=: TCon (TNat 0) ]
+
+  At most one consant
+
+>   | TCon (TNat x) <- a
+>   , TCon (TNat y) <- b  = Just $ eqs [ c :=: TCon (TNat (x + y)) ]
+>
+>   | TCon (TNat x) <- a
+>   , TCon (TNat y) <- c =
+>     Just $ if y >= x then eqs [ b :=: TCon (TNat (y-x)) ]
+>                      else Impossible
+>
+>   | TCon (TNat  x) <- b
+>   , TCon (TNat  y) <- c  =
+>     Just $ if y >= x then eqs [ a :=: TCon (TNat (y-x)) ]
+>                      else Impossible
+
+  The only repeated variables may be in `a + a ~ b`, where `b` is not a consant.
+
+>   | a == c              = Just $ eqs [ b :=: TCon (TNat 0) ]
+>   | b == c              = Just $ eqs [ a :=: TCon (TNat 0) ]
+>   | TCon (TNat k) <- c
+>   , a == b              = Just $ case divMod k 2 of
+>                                    (r,0)  -> eqs [ a :=: TCon (TNat r) ]
+>                                    _      -> Impossible
+
+  Normalization of LHS: variable before constants,
+                        smaller variables before bigger variable
+
+>   | TCon (TNat _) <- a = Just $ Simplified [ FunCt (TFunEqn TAdd [b,a] c) ]
+>   | TVar x <- a
+>   , TVar y <- b
+>   , y < x               = Just $ Simplified [ FunCt (TFunEqn TAdd [b,a] c) ]
+
+>   where
+>   eqs xs = Simplified (map EqCt xs)
+
+>
+> simpArith _ = Nothing
+
+
+> inetractAdd2 (TFunEqn TAdd [a,b] c) (TFunEqn TAdd [x,y] z)
+
+  Injective in one argument
+
+>   | a == x && c == z    = Just $ eqs [ b :=: y ]
+>   | b == y && c == z    = Just $ eqs [ a :=: x ]
+
+
+    + symmetric
+
+    (p + q = r, q + x = r) => (p = x)
+
+
+
+
+    No 2 inerts with constants on the LHS should mention the same variables.
+
+    Order by distance:
+
+    end in the same place
+    (a + (B1 + B2) = c, x + B2 = c)
+    <=>
+    (a + B1 = x, x + B2 = c)
+
+
+    start from the same place
+    (a + (B1 + B2) = c, a + B1 = y)
+    <=>
+    (a + B1 = y, y + B2 = c)
+
+
+    Target of a difference equation can't appear in the LHS
+    of a bounded eqn:
+
+    Overshot:
+    (a + (B1+B2) = c, c + y = B2)
+    <=>
+    False
+
+    Pull back:
+    (a + Z1 = c, c + y = (Z1+Z2))
+    <=>
+    (a + Z1 = c, a + y = Z2)
+
+    Variables in LHS of bound equations are distinct
+    (a + b = (C1 + C2), a + y = C1)
+    <=>
+    (a + y = C1, y + C2 = b)
+
+
+
+
+>   where
+>   eqs xs = Simplified (map EqCt xs)
+
+
+> inetractAdd2 _ _ = Nothing
+
+
 
 
 Solving Type Function Equations
@@ -442,10 +571,12 @@ We start by trying to evaluate the function:
 > -- | Try to resolve a type-function constraint using a definition.
 > interactWithDef :: [TFunDef] -> TFunEqn -> State -> Maybe State
 > interactWithDef defs (TFunEqn tf args res) s =
->   do t <- lookupDef defs tf args
->      return
->        $ updWorkQ s $ \q -> let (q',t') = toSimpleType q t
->                             in addSimpleEqn (res :=: t') q'
+>   msum
+>     [ do t <- lookupDef defs tf args
+>          return
+>            $ updWorkQ s $ \q -> let (q',t') = toSimpleType q t
+>                                 in addSimpleEqn (res :=: t') q'
+>     ]
 
 The function `interactWithDef` tries to reduce the left-hand side
 of the equation one step, using a definition.  If this succeeds, then
@@ -565,5 +696,72 @@ more work to be done, or it detects an inconsistency:
 > -- | Normalize a collection of equations.
 > normalize :: String -> [TFunDef] -> [Eqn Type] -> Maybe Inerts
 > normalize seed defs = makeSteps defs . prepare seed
+
+
+
+Solving Constraints
+===================
+
+> data Implication = Implication
+>   { forAll :: [TVar]
+>   , assume :: Eqn Type
+>   , prove  :: Eqn Type
+>   }
+
+
+1. [G] & [G] -> [G]
+2. [G] & [W] -> [D]
+3. [G] & [D] -> [D]
+4. [W] & [W] -> [W]/[D]
+5. [W] & [D] -> [D]
+6. [D] & [D] -> [D]
+
+In case 4, consider:
+  - [W] & [W] -> [D] two goals interact to compute a new improvement
+  - [W] & [W] -> :q
+
+
+
+
+Derived:
+
+?a : unification variable
+ b : normal variable
+
+Simple derived constrinats:
+  Only bind unification variables, not skolems
+  ?a = t  -- OK
+  a  = t  -- can't use for improvement, but potentially could be useful
+          -- for contradiction.
+
+For example, if we derive `a = Int` and `a = Char`, then the original
+wanted goals are unsatisifiable.
+
+If we derive `?a = t`, then we may replace `?a` with `t` without loosing
+generality.
+
+so, if we need to prove `[W] ?a = Int`, technically we first compute
+`[D] ?a = Int`, then we transform the original goal to `[W] Int = Int`,
+and then we solve by reflexivity.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
